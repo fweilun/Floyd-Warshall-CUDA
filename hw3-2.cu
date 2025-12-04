@@ -7,7 +7,9 @@
 using namespace std;
 
 const int INF = 1073741823;
-const int BLOCK_SIZE = 32; // GPU 適合 32x32 的 block
+const int BLOCK_SIZE = 32; 
+// 修正 1: 配合 Phase 3 的邏輯，這裡必須是 64
+const int EXTEND_BLOCK_SIZE = 64; 
 
 #define cudaCheck(err) (cudaCheckImpl(err, __FILE__, __LINE__))
 void cudaCheckImpl(cudaError_t err, const char* file, int line) {
@@ -17,209 +19,223 @@ void cudaCheckImpl(cudaError_t err, const char* file, int line) {
     }
 }
 
+// 修正 2: Phase 1 必須處理 64x64 的對角線區塊
 __global__ void phase1(int* dist, int V, int Round) {
-    __shared__ int smem[BLOCK_SIZE][BLOCK_SIZE];
+    // 宣告 64x64 的 shared memory
+    __shared__ int smem[EXTEND_BLOCK_SIZE][EXTEND_BLOCK_SIZE];
 
     int tx = threadIdx.x;
     int ty = threadIdx.y;
-    int global_x = Round * BLOCK_SIZE + tx;
-    int global_y = Round * BLOCK_SIZE + ty;
-    smem[ty][tx] = dist[global_y * V + global_x];
+    
+    int start_idx = Round * EXTEND_BLOCK_SIZE;
+    smem[ty][tx] = dist[(start_idx + ty) * V + (start_idx + tx)];
+    smem[ty][tx + BLOCK_SIZE] = dist[(start_idx + ty) * V + (start_idx + tx + BLOCK_SIZE)];
+    smem[ty + BLOCK_SIZE][tx] = dist[(start_idx + ty + BLOCK_SIZE) * V + (start_idx + tx)];
+    smem[ty + BLOCK_SIZE][tx + BLOCK_SIZE] = dist[(start_idx + ty + BLOCK_SIZE) * V + (start_idx + tx + BLOCK_SIZE)];
+
     __syncthreads();
 
     #pragma unroll
-    for (int k = 0; k < BLOCK_SIZE; ++k) {
-        int val = smem[ty][k] + smem[k][tx];
-        if (val < smem[ty][tx]) {
-            smem[ty][tx] = val;
-        }
+    for (int k = 0; k < EXTEND_BLOCK_SIZE; ++k) {
+        // 更新 4 個點
+        smem[ty][tx] = min(smem[ty][tx], smem[ty][k] + smem[k][tx]);
+        smem[ty][tx + BLOCK_SIZE] = min(smem[ty][tx + BLOCK_SIZE], smem[ty][k] + smem[k][tx + BLOCK_SIZE]);
+        smem[ty + BLOCK_SIZE][tx] = min(smem[ty + BLOCK_SIZE][tx], smem[ty + BLOCK_SIZE][k] + smem[k][tx]);
+        smem[ty + BLOCK_SIZE][tx + BLOCK_SIZE] = min(smem[ty + BLOCK_SIZE][tx + BLOCK_SIZE], smem[ty + BLOCK_SIZE][k] + smem[k][tx + BLOCK_SIZE]);
+        
         __syncthreads();
     }
 
     // 寫回 Global Memory
-    dist[global_y * V + global_x] = smem[ty][tx];
+    dist[(start_idx + ty) * V + (start_idx + tx)] = smem[ty][tx];
+    dist[(start_idx + ty) * V + (start_idx + tx + BLOCK_SIZE)] = smem[ty][tx + BLOCK_SIZE];
+    dist[(start_idx + ty + BLOCK_SIZE) * V + (start_idx + tx)] = smem[ty + BLOCK_SIZE][tx];
+    dist[(start_idx + ty + BLOCK_SIZE) * V + (start_idx + tx + BLOCK_SIZE)] = smem[ty + BLOCK_SIZE][tx + BLOCK_SIZE];
 }
 
+// 修正 3: Phase 2 必須處理 64x64 的 Pivot Block 和 Target Block
 __global__ void phase2(int* dist, int V, int Round) {
-    if (blockIdx.x == Round) return; // 對角線 Block 已經在 Phase 1 處理過
+    if (blockIdx.x == Round) return; 
 
-    __shared__ int pivot_block[BLOCK_SIZE][BLOCK_SIZE];
-    __shared__ int target_block[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ int pivot[EXTEND_BLOCK_SIZE][EXTEND_BLOCK_SIZE];
+    __shared__ int target[EXTEND_BLOCK_SIZE][EXTEND_BLOCK_SIZE];
 
     int tx = threadIdx.x;
     int ty = threadIdx.y;
 
-    int pivot_base_idx = Round * BLOCK_SIZE;
-    
-    // 定義目標 Block 的位置
+    int pivot_base = Round * EXTEND_BLOCK_SIZE;
     int target_base_x, target_base_y;
 
+    // 判斷是處理 Row 還是 Col
     if (blockIdx.y == 0) {
-        // 處理 Row Round: (Round, i)
-        target_base_y = Round * BLOCK_SIZE;
-        target_base_x = blockIdx.x * BLOCK_SIZE;
+        target_base_y = Round * EXTEND_BLOCK_SIZE;
+        target_base_x = blockIdx.x * EXTEND_BLOCK_SIZE;
     } else {
-        // 處理 Col Round: (i, Round)
-        target_base_y = blockIdx.x * BLOCK_SIZE;
-        target_base_x = Round * BLOCK_SIZE;
+        target_base_y = blockIdx.x * EXTEND_BLOCK_SIZE;
+        target_base_x = Round * EXTEND_BLOCK_SIZE;
     }
 
-    // 載入 Pivot Block (Phase 1 已經算好的对角线块)
-    pivot_block[ty][tx] = dist[(pivot_base_idx + ty) * V + (pivot_base_idx + tx)];
-    // 載入 Target Block (當前要更新的块)
-    target_block[ty][tx] = dist[(target_base_y + ty) * V + (target_base_x + tx)];
+    // --- Load Pivot ---
+    pivot[ty][tx] = dist[(pivot_base + ty) * V + (pivot_base + tx)];
+    pivot[ty][tx + BLOCK_SIZE] = dist[(pivot_base + ty) * V + (pivot_base + tx + BLOCK_SIZE)];
+    pivot[ty + BLOCK_SIZE][tx] = dist[(pivot_base + ty + BLOCK_SIZE) * V + (pivot_base + tx)];
+    pivot[ty + BLOCK_SIZE][tx + BLOCK_SIZE] = dist[(pivot_base + ty + BLOCK_SIZE) * V + (pivot_base + tx + BLOCK_SIZE)];
+
+    // --- Load Target ---
+    target[ty][tx] = dist[(target_base_y + ty) * V + (target_base_x + tx)];
+    target[ty][tx + BLOCK_SIZE] = dist[(target_base_y + ty) * V + (target_base_x + tx + BLOCK_SIZE)];
+    target[ty + BLOCK_SIZE][tx] = dist[(target_base_y + ty + BLOCK_SIZE) * V + (target_base_x + tx)];
+    target[ty + BLOCK_SIZE][tx + BLOCK_SIZE] = dist[(target_base_y + ty + BLOCK_SIZE) * V + (target_base_x + tx + BLOCK_SIZE)];
     
     __syncthreads();
-    if (blockIdx.y == 0) {
-        #pragma unroll
-        for (int k = 0; k < BLOCK_SIZE; ++k) {
-            int val = pivot_block[ty][k] + target_block[k][tx];
-            if (val < target_block[ty][tx]) {
-                target_block[ty][tx] = val;
-            }
-        }
-    } else {
-        // Col Strip
-        #pragma unroll
-        for (int k = 0; k < BLOCK_SIZE; ++k) {
-            int val = target_block[ty][k] + pivot_block[k][tx];
-            if (val < target_block[ty][tx]) {
-                target_block[ty][tx] = val;
-            }
+
+    // 計算 64 次迭代
+    #pragma unroll
+    for (int k = 0; k < EXTEND_BLOCK_SIZE; ++k) {
+        int p_row, p_col;
+
+        if (blockIdx.y == 0) {
+            int p_val = pivot[ty][k];
+            int p_val_b = pivot[ty + BLOCK_SIZE][k];
+
+            target[ty][tx] = min(target[ty][tx], p_val + target[k][tx]);
+            target[ty][tx + BLOCK_SIZE] = min(target[ty][tx + BLOCK_SIZE], p_val + target[k][tx + BLOCK_SIZE]);
+            target[ty + BLOCK_SIZE][tx] = min(target[ty + BLOCK_SIZE][tx], p_val_b + target[k][tx]);
+            target[ty + BLOCK_SIZE][tx + BLOCK_SIZE] = min(target[ty + BLOCK_SIZE][tx + BLOCK_SIZE], p_val_b + target[k][tx + BLOCK_SIZE]);
+
+        } else {
+            int p_val = pivot[k][tx];
+            int p_val_r = pivot[k][tx + BLOCK_SIZE];
+
+            target[ty][tx] = min(target[ty][tx], target[ty][k] + p_val);
+            target[ty][tx + BLOCK_SIZE] = min(target[ty][tx + BLOCK_SIZE], target[ty][k] + p_val_r);
+            target[ty + BLOCK_SIZE][tx] = min(target[ty + BLOCK_SIZE][tx], target[ty + BLOCK_SIZE][k] + p_val);
+            target[ty + BLOCK_SIZE][tx + BLOCK_SIZE] = min(target[ty + BLOCK_SIZE][tx + BLOCK_SIZE], target[ty + BLOCK_SIZE][k] + p_val_r);
         }
     }
 
-    __syncthreads();
-    dist[(target_base_y + ty) * V + (target_base_x + tx)] = target_block[ty][tx];
+    // 寫回 Global Memory
+    dist[(target_base_y + ty) * V + (target_base_x + tx)] = target[ty][tx];
+    dist[(target_base_y + ty) * V + (target_base_x + tx + BLOCK_SIZE)] = target[ty][tx + BLOCK_SIZE];
+    dist[(target_base_y + ty + BLOCK_SIZE) * V + (target_base_x + tx)] = target[ty + BLOCK_SIZE][tx];
+    dist[(target_base_y + ty + BLOCK_SIZE) * V + (target_base_x + tx + BLOCK_SIZE)] = target[ty + BLOCK_SIZE][tx + BLOCK_SIZE];
 }
 
 __global__ void phase3(int* dist, int V, int Round) {
-    // blockIdx.x: Col Id, blockIdx.y: Row Id
     if (blockIdx.x == Round || blockIdx.y == Round) return;
 
-    __shared__ int row_block[BLOCK_SIZE][BLOCK_SIZE];
-    __shared__ int col_block[BLOCK_SIZE][BLOCK_SIZE];
+    // 這裡使用 EXTEND_BLOCK_SIZE = 64
+    const int sm_width = EXTEND_BLOCK_SIZE;
+    
+    __shared__ int row_block[EXTEND_BLOCK_SIZE * EXTEND_BLOCK_SIZE];
+    __shared__ int col_block[EXTEND_BLOCK_SIZE * EXTEND_BLOCK_SIZE];
 
     int tx = threadIdx.x;
     int ty = threadIdx.y;
 
-    // 我們要更新的 Block (i, j)
-    int i_start = blockIdx.y * BLOCK_SIZE;
-    int j_start = blockIdx.x * BLOCK_SIZE;
+    int i_start = blockIdx.y * EXTEND_BLOCK_SIZE;
+    int j_start = blockIdx.x * EXTEND_BLOCK_SIZE;
     
-    // 相依 Block 1: (i, Round) -> 也就是 Col Block (在 Phase 2 算好的)
     int col_strip_y = i_start;
-    int col_strip_x = Round * BLOCK_SIZE;
-
-    // 相依 Block 2: (Round, j) -> 也就是 Row Block (在 Phase 2 算好的)
-    int row_strip_y = Round * BLOCK_SIZE;
+    int col_strip_x = Round * EXTEND_BLOCK_SIZE;
+    int row_strip_y = Round * EXTEND_BLOCK_SIZE;
     int row_strip_x = j_start;
 
-    // 載入相依數據到 Shared Memory
-    // Col Block: (i, Round)
-    col_block[ty][tx] = dist[(col_strip_y + ty) * V + (col_strip_x + tx)];
-    // Row Block: (Round, j)
-    row_block[ty][tx] = dist[(row_strip_y + ty) * V + (row_strip_x + tx)];
+    // 1. 左上
+    col_block[ty * sm_width + tx] = dist[(col_strip_y + ty) * V + (col_strip_x + tx)];
+    row_block[ty * sm_width + tx] = dist[(row_strip_y + ty) * V + (row_strip_x + tx)];
+    // 2. 右上
+    col_block[ty * sm_width + (tx + BLOCK_SIZE)] = dist[(col_strip_y + ty) * V + (col_strip_x + tx + BLOCK_SIZE)];
+    row_block[ty * sm_width + (tx + BLOCK_SIZE)] = dist[(row_strip_y + ty) * V + (row_strip_x + tx + BLOCK_SIZE)];
+    // 3. 左下
+    col_block[(ty + BLOCK_SIZE) * sm_width + tx] = dist[(col_strip_y + ty + BLOCK_SIZE) * V + (col_strip_x + tx)];
+    row_block[(ty + BLOCK_SIZE) * sm_width + tx] = dist[(row_strip_y + ty + BLOCK_SIZE) * V + (row_strip_x + tx)];
+    // 4. 右下
+    col_block[(ty + BLOCK_SIZE) * sm_width + (tx + BLOCK_SIZE)] = dist[(col_strip_y + ty + BLOCK_SIZE) * V + (col_strip_x + tx + BLOCK_SIZE)];
+    row_block[(ty + BLOCK_SIZE) * sm_width + (tx + BLOCK_SIZE)] = dist[(row_strip_y + ty + BLOCK_SIZE) * V + (row_strip_x + tx + BLOCK_SIZE)];
 
     __syncthreads();
     
-    int current_val = dist[(i_start + ty) * V + (j_start + tx)];
+    int v1 = dist[(i_start + ty) * V + (j_start + tx)];
+    int v2 = dist[(i_start + ty) * V + (j_start + tx + BLOCK_SIZE)];
+    int v3 = dist[(i_start + ty + BLOCK_SIZE) * V + (j_start + tx)];
+    int v4 = dist[(i_start + ty + BLOCK_SIZE) * V + (j_start + tx + BLOCK_SIZE)];
     
     #pragma unroll
-    for (int k = 0; k < BLOCK_SIZE; ++k) {
-        int val = col_block[ty][k] + row_block[k][tx];
-        if (val < current_val) {
-            current_val = val;
-        }
+    for (int k = 0; k < EXTEND_BLOCK_SIZE; ++k) {
+        int col_val_top = col_block[ty * sm_width + k];
+        int col_val_bot = col_block[(ty + BLOCK_SIZE) * sm_width + k];
+        
+        int row_val_left = row_block[k * sm_width + tx];
+        int row_val_right = row_block[k * sm_width + (tx + BLOCK_SIZE)];
+
+        v1 = min(v1, col_val_top + row_val_left);
+        v2 = min(v2, col_val_top + row_val_right);
+        v3 = min(v3, col_val_bot + row_val_left);
+        v4 = min(v4, col_val_bot + row_val_right);
     }
     
-    dist[(i_start + ty) * V + (j_start + tx)] = current_val;
+    dist[(i_start + ty) * V + (j_start + tx)] = v1;
+    dist[(i_start + ty) * V + (j_start + tx + BLOCK_SIZE)] = v2;
+    dist[(i_start + ty + BLOCK_SIZE) * V + (j_start + tx)] = v3;
+    dist[(i_start + ty + BLOCK_SIZE) * V + (j_start + tx + BLOCK_SIZE)] = v4;
 }
 
-
 int main(int argc, char *argv[]) {
-
     FILE* file = fopen(argv[1], "r");
-    if (!file) {
-        fprintf(stderr, "fopen failed: %s\n", argv[1]);
-        return 1;
-    }
-
+    if (!file) return 1;
     int V, E;
-    if (fread(&V, sizeof(int), 1, file) != 1) return 1;
-    if (fread(&E, sizeof(int), 1, file) != 1) return 1;
-    
-    printf("V: %d, E: %d\n", V, E);
+    fread(&V, sizeof(int), 1, file);
+    fread(&E, sizeof(int), 1, file);
 
-    // Padding V to be multiple of BLOCK_SIZE
-    int padded_V = ((V + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+    // Padding 到 64 的倍數
+    int padded_V = ((V + EXTEND_BLOCK_SIZE - 1) / EXTEND_BLOCK_SIZE) * EXTEND_BLOCK_SIZE;
     size_t size = sizeof(int) * padded_V * padded_V;
-    
-    // Allocate Host Memory (Pinned memory is faster for transfer)
     int *h_dist;
     cudaCheck(cudaMallocHost(&h_dist, size));
 
     for (int i = 0; i < padded_V; ++i) {
         for (int j = 0; j < padded_V; ++j) {
-            if (i == j) h_dist[i * padded_V + j] = 0;
-            else h_dist[i * padded_V + j] = INF;
+            h_dist[i * padded_V + j] = (i == j) ? 0 : INF;
         }
     }
 
-    // Read Edges
-    // 雖然一次讀全部比較快，但為了處理 Padding，我們需要讀進緩衝區再填入
     vector<int> edge_buffer(E * 3);
-    fread(&edge_buffer[0], sizeof(int), E * 3, file) != (size_t)(E * 3);
+    fread(edge_buffer.data(), sizeof(int), E * 3, file) != (size_t)(E * 3);
     fclose(file);
 
     for (int i = 0; i < E; ++i) {
         int u = edge_buffer[i*3 + 0];
         int v = edge_buffer[i*3 + 1];
         int w = edge_buffer[i*3 + 2];
-        // 寫入 Padded Matrix
         h_dist[u * padded_V + v] = w;
     }
 
-    // Allocate Device Memory
     int *d_dist;
     cudaCheck(cudaMalloc(&d_dist, size));
-
-    // Copy Host to Device
     cudaCheck(cudaMemcpy(d_dist, h_dist, size, cudaMemcpyHostToDevice));
 
-    // Launch Kernels
-    int rounds = padded_V / BLOCK_SIZE;
+    int rounds = padded_V / EXTEND_BLOCK_SIZE; 
     dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
 
     for (int r = 0; r < rounds; ++r) {
-        // Phase 1
         phase1<<<1, dimBlock>>>(d_dist, padded_V, r);
         
-        // Phase 2
         dim3 dimGrid2(rounds, 2); 
         phase2<<<dimGrid2, dimBlock>>>(d_dist, padded_V, r);
         
-        // Phase 3
         dim3 dimGrid3(rounds, rounds);
         phase3<<<dimGrid3, dimBlock>>>(d_dist, padded_V, r);
     }
-    cudaCheck(cudaDeviceSynchronize());
-    cudaCheck(cudaGetLastError());
-
-    // Copy back to Host
+    
     cudaCheck(cudaMemcpy(h_dist, d_dist, size, cudaMemcpyDeviceToHost));
     ofstream out(argv[2], ios::binary);
-    if (V == padded_V) {
-        out.write((char*)h_dist, sizeof(int) * V * V);
-    } else {
-        for (int i = 0; i < V; ++i) {
-            out.write((char*)&h_dist[i * padded_V], sizeof(int) * V);
-        }
+    for (int i = 0; i < V; ++i) {
+        out.write((char*)&h_dist[i * padded_V], sizeof(int) * V);
     }
-    
     out.close();
+    
     cudaFreeHost(h_dist);
     cudaFree(d_dist);
-
     return 0;
 }
