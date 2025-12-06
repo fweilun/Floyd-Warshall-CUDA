@@ -3,239 +3,299 @@
 #include <vector>
 #include <algorithm>
 #include <cuda_runtime.h>
+#include <device_launch_parameters.h>
 
 using namespace std;
 
+// 設定常數
 const int INF = 1073741823;
-const int BLOCK_SIZE = 32; 
-// 修正 1: 配合 Phase 3 的邏輯，這裡必須是 64
-const int EXTEND_BLOCK_SIZE = 64; 
+const int BLOCK_SIZE = 64; // 與 CPU 版本的 B 保持一致，適合 GPU Shared Memory
 
-#define cudaCheck(err) (cudaCheckImpl(err, __FILE__, __LINE__))
-void cudaCheckImpl(cudaError_t err, const char* file, int line) {
+// CUDA Error Check Helper
+#define cudaCheck(err) (cudaCheckError(err, __FILE__, __LINE__))
+void cudaCheckError(cudaError_t err, const char *file, int line) {
     if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA Error: %s in %s at line %d\n", cudaGetErrorString(err), file, line);
+        fprintf(stderr, "CUDA Error: %s at %s:%d\n", cudaGetErrorString(err), file, line);
         exit(EXIT_FAILURE);
     }
 }
 
-// 修正 2: Phase 1 必須處理 64x64 的對角線區塊
-__global__ void phase1(int* dist, int V, int Round) {
-    // 宣告 64x64 的 shared memory
-    __shared__ int smem[EXTEND_BLOCK_SIZE][EXTEND_BLOCK_SIZE];
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    
-    int start_idx = Round * EXTEND_BLOCK_SIZE;
-    smem[ty][tx] = dist[(start_idx + ty) * V + (start_idx + tx)];
-    smem[ty][tx + BLOCK_SIZE] = dist[(start_idx + ty) * V + (start_idx + tx + BLOCK_SIZE)];
-    smem[ty + BLOCK_SIZE][tx] = dist[(start_idx + ty + BLOCK_SIZE) * V + (start_idx + tx)];
-    smem[ty + BLOCK_SIZE][tx + BLOCK_SIZE] = dist[(start_idx + ty + BLOCK_SIZE) * V + (start_idx + tx + BLOCK_SIZE)];
-
-    __syncthreads();
-
-    #pragma unroll
-    for (int k = 0; k < EXTEND_BLOCK_SIZE; ++k) {
-        // 更新 4 個點
-        smem[ty][tx] = min(smem[ty][tx], smem[ty][k] + smem[k][tx]);
-        smem[ty][tx + BLOCK_SIZE] = min(smem[ty][tx + BLOCK_SIZE], smem[ty][k] + smem[k][tx + BLOCK_SIZE]);
-        smem[ty + BLOCK_SIZE][tx] = min(smem[ty + BLOCK_SIZE][tx], smem[ty + BLOCK_SIZE][k] + smem[k][tx]);
-        smem[ty + BLOCK_SIZE][tx + BLOCK_SIZE] = min(smem[ty + BLOCK_SIZE][tx + BLOCK_SIZE], smem[ty + BLOCK_SIZE][k] + smem[k][tx + BLOCK_SIZE]);
-        
-        __syncthreads();
-    }
-
-    // 寫回 Global Memory
-    dist[(start_idx + ty) * V + (start_idx + tx)] = smem[ty][tx];
-    dist[(start_idx + ty) * V + (start_idx + tx + BLOCK_SIZE)] = smem[ty][tx + BLOCK_SIZE];
-    dist[(start_idx + ty + BLOCK_SIZE) * V + (start_idx + tx)] = smem[ty + BLOCK_SIZE][tx];
-    dist[(start_idx + ty + BLOCK_SIZE) * V + (start_idx + tx + BLOCK_SIZE)] = smem[ty + BLOCK_SIZE][tx + BLOCK_SIZE];
+// 輔助函數：計算向上取整
+inline int ceil_div(int a, int b) {
+    return (a + b - 1) / b;
 }
 
-// 修正 3: Phase 2 必須處理 64x64 的 Pivot Block 和 Target Block
-__global__ void phase2(int* dist, int V, int Round) {
-    if (blockIdx.x == Round) return; 
 
-    __shared__ int pivot[EXTEND_BLOCK_SIZE][EXTEND_BLOCK_SIZE];
-    __shared__ int target[EXTEND_BLOCK_SIZE][EXTEND_BLOCK_SIZE];
+__global__ void floyd_warshall_block_kernel(int* dist, int V_padded, int Round, int mode) {
+    int bx, by;
 
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-
-    int pivot_base = Round * EXTEND_BLOCK_SIZE;
-    int target_base_x, target_base_y;
-
-    // 判斷是處理 Row 還是 Col
-    if (blockIdx.y == 0) {
-        target_base_y = Round * EXTEND_BLOCK_SIZE;
-        target_base_x = blockIdx.x * EXTEND_BLOCK_SIZE;
+    if (mode == 0) {
+        bx = Round;
+        by = Round;
+    } else if (mode == 1) {
+        int idx = blockIdx.x; 
+        if (blockIdx.y == 0) { 
+            bx = (idx < Round) ? idx : idx + 1;
+            by = Round;
+        } else {
+            // 處理 Pivot Col: (idx, Round)
+            bx = Round;
+            by = (idx < Round) ? idx : idx + 1;
+        }
     } else {
-        target_base_y = blockIdx.x * EXTEND_BLOCK_SIZE;
-        target_base_x = Round * EXTEND_BLOCK_SIZE;
+        // Phase 3: 處理所有剩餘 Block (by, bx)
+        // 注意跳過 Pivot Row 和 Pivot Col
+        bx = blockIdx.x;
+        by = blockIdx.y;
+        // 如果剛好是對角線所在的行或列，直接退出 (Phase 1, 2 已處理)
+        if (bx == Round || by == Round) return; 
     }
 
-    // --- Load Pivot ---
-    pivot[ty][tx] = dist[(pivot_base + ty) * V + (pivot_base + tx)];
-    pivot[ty][tx + BLOCK_SIZE] = dist[(pivot_base + ty) * V + (pivot_base + tx + BLOCK_SIZE)];
-    pivot[ty + BLOCK_SIZE][tx] = dist[(pivot_base + ty + BLOCK_SIZE) * V + (pivot_base + tx)];
-    pivot[ty + BLOCK_SIZE][tx + BLOCK_SIZE] = dist[(pivot_base + ty + BLOCK_SIZE) * V + (pivot_base + tx + BLOCK_SIZE)];
+    __shared__ int sm_a[64][64]; // Pivot Col Block: dist[by][Round] -> 用於提供 dist[i][k]
+    __shared__ int sm_b[64][64]; // Pivot Row Block: dist[Round][bx] -> 用於提供 dist[k][j]
 
-    // --- Load Target ---
-    target[ty][tx] = dist[(target_base_y + ty) * V + (target_base_x + tx)];
-    target[ty][tx + BLOCK_SIZE] = dist[(target_base_y + ty) * V + (target_base_x + tx + BLOCK_SIZE)];
-    target[ty + BLOCK_SIZE][tx] = dist[(target_base_y + ty + BLOCK_SIZE) * V + (target_base_x + tx)];
-    target[ty + BLOCK_SIZE][tx + BLOCK_SIZE] = dist[(target_base_y + ty + BLOCK_SIZE) * V + (target_base_x + tx + BLOCK_SIZE)];
+    // 執行緒 ID
+    int tx = threadIdx.x; // 0..15
+    int ty = threadIdx.y; // 0..15
+
+    // 計算當前 Block 在 Global Memory 的起始偏移量
+    // 每個 Block 大小 64x64
+    size_t block_start_idx = (size_t)by * 64 * V_padded + bx * 64;
+    size_t pivot_col_start = (size_t)by * 64 * V_padded + Round * 64;
+    size_t pivot_row_start = (size_t)Round * 64 * V_padded + bx * 64;
+
+    // ---------------------------------------------------
+    // 1. 載入資料到 Shared Memory
+    // ---------------------------------------------------
+    // 每個執行緒負責載入一部分數據。
+    // Block 大小 64x64 = 4096 ints. Threads = 256. 每個執行緒載入 16 ints (4 個 int4)
     
-    __syncthreads();
+    // 為了利用 int4，我們將指針轉型
+    int4* gl_ptr_a = (int4*)(dist + pivot_col_start);
+    int4* gl_ptr_b = (int4*)(dist + pivot_row_start);
 
-    // 計算 64 次迭代
+    // 映射：執行緒 (ty, tx) 視為線性 ID
+    int tid = ty * 16 + tx;
+    
+    // 每個執行緒載入 4 行 (因為 64行 / 16(blockDim.y) = 4)
+    // 但為了 int4 對齊，我們按行載入
+    // sm_a[Row][Col]
+    // 每個 int4 包含 4 個 int，對應 4 列
+    // 我們需要載入整個 64x64
+    // 簡單映射: tx 對應 x 軸的 0..15 (x4 -> 0..63)
+    // ty 對應 y 軸的 0..15, 16..31, 32..47, 48..63 (stride 16)
+
     #pragma unroll
-    for (int k = 0; k < EXTEND_BLOCK_SIZE; ++k) {
-        int p_row, p_col;
+    for (int i = 0; i < 4; ++i) {
+        int row = ty + i * 16;
+        
+        // Load Pivot Col Block -> sm_a
+        // 讀取 Global Memory
+        int4 vec_a = gl_ptr_a[row * (V_padded / 4) + tx];
+        sm_a[row][tx * 4 + 0] = vec_a.x;
+        sm_a[row][tx * 4 + 1] = vec_a.y;
+        sm_a[row][tx * 4 + 2] = vec_a.z;
+        sm_a[row][tx * 4 + 3] = vec_a.w;
 
-        if (blockIdx.y == 0) {
-            int p_val = pivot[ty][k];
-            int p_val_b = pivot[ty + BLOCK_SIZE][k];
+        // Load Pivot Row Block -> sm_b
+        int4 vec_b = gl_ptr_b[row * (V_padded / 4) + tx];
+        sm_b[row][tx * 4 + 0] = vec_b.x;
+        sm_b[row][tx * 4 + 1] = vec_b.y;
+        sm_b[row][tx * 4 + 2] = vec_b.z;
+        sm_b[row][tx * 4 + 3] = vec_b.w;
+    }
 
-            target[ty][tx] = min(target[ty][tx], p_val + target[k][tx]);
-            target[ty][tx + BLOCK_SIZE] = min(target[ty][tx + BLOCK_SIZE], p_val + target[k][tx + BLOCK_SIZE]);
-            target[ty + BLOCK_SIZE][tx] = min(target[ty + BLOCK_SIZE][tx], p_val_b + target[k][tx]);
-            target[ty + BLOCK_SIZE][tx + BLOCK_SIZE] = min(target[ty + BLOCK_SIZE][tx + BLOCK_SIZE], p_val_b + target[k][tx + BLOCK_SIZE]);
+    __syncthreads();
+    
+    int4* gl_ptr_c = (int4*)(dist + block_start_idx);
+    int my_dist[4][4]; // Registers: [row_offset][col_offset]
 
-        } else {
-            int p_val = pivot[k][tx];
-            int p_val_r = pivot[k][tx + BLOCK_SIZE];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int row = ty * 4 + i; // 每個 thread 負責連續的 4 行，以配合 int4 寫入? 
+        
+        row = ty + i * 16; 
+        
+        int4 vec_c = gl_ptr_c[row * (V_padded / 4) + tx];
+        my_dist[i][0] = vec_c.x;
+        my_dist[i][1] = vec_c.y;
+        my_dist[i][2] = vec_c.z;
+        my_dist[i][3] = vec_c.w;
+    }
 
-            target[ty][tx] = min(target[ty][tx], target[ty][k] + p_val);
-            target[ty][tx + BLOCK_SIZE] = min(target[ty][tx + BLOCK_SIZE], target[ty][k] + p_val_r);
-            target[ty + BLOCK_SIZE][tx] = min(target[ty + BLOCK_SIZE][tx], target[ty + BLOCK_SIZE][k] + p_val);
-            target[ty + BLOCK_SIZE][tx + BLOCK_SIZE] = min(target[ty + BLOCK_SIZE][tx + BLOCK_SIZE], target[ty + BLOCK_SIZE][k] + p_val_r);
+    if (mode == 0) {
+        for (int k = 0; k < 64; ++k) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int row = ty + i * 16;
+                int dik = sm_a[row][k]; // 廣播
+                
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    int col = tx * 4 + j;
+                    int dkj = sm_a[k][col];
+                    int sum = dik + dkj;
+                    if (sum < sm_a[row][col]) {
+                        sm_a[row][col] = sum;
+                    }
+                }
+            }
+            __syncthreads(); // 必須同步，讓別的 thread 看到新的 sm_a
+        }
+        
+        // 寫回 Global Memory
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int row = ty + i * 16;
+            int4 vec_out;
+            vec_out.x = sm_a[row][tx * 4 + 0];
+            vec_out.y = sm_a[row][tx * 4 + 1];
+            vec_out.z = sm_a[row][tx * 4 + 2];
+            vec_out.w = sm_a[row][tx * 4 + 3];
+            gl_ptr_c[row * (V_padded / 4) + tx] = vec_out;
+        }
+
+    } else {
+        for (int k = 0; k < 64; ++k) {
+            int d_row_k[4]; // sm_b[k][tx*4 + 0..3]
+            d_row_k[0] = sm_b[k][tx * 4 + 0];
+            d_row_k[1] = sm_b[k][tx * 4 + 1];
+            d_row_k[2] = sm_b[k][tx * 4 + 2];
+            d_row_k[3] = sm_b[k][tx * 4 + 3];
+
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int row = ty + i * 16;
+                int d_col_k = sm_a[row][k]; // sm_a[row][k]
+                
+                // 更新 4 個列
+                /* Vectorized add & min is tricky in pure int, so standard logic */
+                // Logic: my_dist[i][j] = min(my_dist[i][j], d_col_k + d_row_k[j])
+                
+                // 為了性能，手動展開
+                int sum;
+                
+                sum = d_col_k + d_row_k[0];
+                if (sum < my_dist[i][0]) my_dist[i][0] = sum;
+
+                sum = d_col_k + d_row_k[1];
+                if (sum < my_dist[i][1]) my_dist[i][1] = sum;
+
+                sum = d_col_k + d_row_k[2];
+                if (sum < my_dist[i][2]) my_dist[i][2] = sum;
+
+                sum = d_col_k + d_row_k[3];
+                if (sum < my_dist[i][3]) my_dist[i][3] = sum;
+            }
+        }
+        
+        // 寫回 Global Memory
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int row = ty + i * 16;
+            int4 vec_out;
+            vec_out.x = my_dist[i][0];
+            vec_out.y = my_dist[i][1];
+            vec_out.z = my_dist[i][2];
+            vec_out.w = my_dist[i][3];
+            gl_ptr_c[row * (V_padded / 4) + tx] = vec_out;
         }
     }
-
-    // 寫回 Global Memory
-    dist[(target_base_y + ty) * V + (target_base_x + tx)] = target[ty][tx];
-    dist[(target_base_y + ty) * V + (target_base_x + tx + BLOCK_SIZE)] = target[ty][tx + BLOCK_SIZE];
-    dist[(target_base_y + ty + BLOCK_SIZE) * V + (target_base_x + tx)] = target[ty + BLOCK_SIZE][tx];
-    dist[(target_base_y + ty + BLOCK_SIZE) * V + (target_base_x + tx + BLOCK_SIZE)] = target[ty + BLOCK_SIZE][tx + BLOCK_SIZE];
 }
 
-__global__ void phase3(int* dist, int V, int Round) {
-    if (blockIdx.x == Round || blockIdx.y == Round) return;
-
-    // 這裡使用 EXTEND_BLOCK_SIZE = 64
-    const int sm_width = EXTEND_BLOCK_SIZE;
-    
-    __shared__ int row_block[EXTEND_BLOCK_SIZE * EXTEND_BLOCK_SIZE];
-    __shared__ int col_block[EXTEND_BLOCK_SIZE * EXTEND_BLOCK_SIZE];
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-
-    int i_start = blockIdx.y * EXTEND_BLOCK_SIZE;
-    int j_start = blockIdx.x * EXTEND_BLOCK_SIZE;
-    
-    int col_strip_y = i_start;
-    int col_strip_x = Round * EXTEND_BLOCK_SIZE;
-    int row_strip_y = Round * EXTEND_BLOCK_SIZE;
-    int row_strip_x = j_start;
-
-    // 1. 左上
-    col_block[ty * sm_width + tx] = dist[(col_strip_y + ty) * V + (col_strip_x + tx)];
-    row_block[ty * sm_width + tx] = dist[(row_strip_y + ty) * V + (row_strip_x + tx)];
-    // 2. 右上
-    col_block[ty * sm_width + (tx + BLOCK_SIZE)] = dist[(col_strip_y + ty) * V + (col_strip_x + tx + BLOCK_SIZE)];
-    row_block[ty * sm_width + (tx + BLOCK_SIZE)] = dist[(row_strip_y + ty) * V + (row_strip_x + tx + BLOCK_SIZE)];
-    // 3. 左下
-    col_block[(ty + BLOCK_SIZE) * sm_width + tx] = dist[(col_strip_y + ty + BLOCK_SIZE) * V + (col_strip_x + tx)];
-    row_block[(ty + BLOCK_SIZE) * sm_width + tx] = dist[(row_strip_y + ty + BLOCK_SIZE) * V + (row_strip_x + tx)];
-    // 4. 右下
-    col_block[(ty + BLOCK_SIZE) * sm_width + (tx + BLOCK_SIZE)] = dist[(col_strip_y + ty + BLOCK_SIZE) * V + (col_strip_x + tx + BLOCK_SIZE)];
-    row_block[(ty + BLOCK_SIZE) * sm_width + (tx + BLOCK_SIZE)] = dist[(row_strip_y + ty + BLOCK_SIZE) * V + (row_strip_x + tx + BLOCK_SIZE)];
-
-    __syncthreads();
-    
-    int v1 = dist[(i_start + ty) * V + (j_start + tx)];
-    int v2 = dist[(i_start + ty) * V + (j_start + tx + BLOCK_SIZE)];
-    int v3 = dist[(i_start + ty + BLOCK_SIZE) * V + (j_start + tx)];
-    int v4 = dist[(i_start + ty + BLOCK_SIZE) * V + (j_start + tx + BLOCK_SIZE)];
-    
-    #pragma unroll
-    for (int k = 0; k < EXTEND_BLOCK_SIZE; ++k) {
-        int col_val_top = col_block[ty * sm_width + k];
-        int col_val_bot = col_block[(ty + BLOCK_SIZE) * sm_width + k];
-        
-        int row_val_left = row_block[k * sm_width + tx];
-        int row_val_right = row_block[k * sm_width + (tx + BLOCK_SIZE)];
-
-        v1 = min(v1, col_val_top + row_val_left);
-        v2 = min(v2, col_val_top + row_val_right);
-        v3 = min(v3, col_val_bot + row_val_left);
-        v4 = min(v4, col_val_bot + row_val_right);
-    }
-    
-    dist[(i_start + ty) * V + (j_start + tx)] = v1;
-    dist[(i_start + ty) * V + (j_start + tx + BLOCK_SIZE)] = v2;
-    dist[(i_start + ty + BLOCK_SIZE) * V + (j_start + tx)] = v3;
-    dist[(i_start + ty + BLOCK_SIZE) * V + (j_start + tx + BLOCK_SIZE)] = v4;
-}
+// ---------------------------------------------------------------------------
+// Main Logic
+// ---------------------------------------------------------------------------
 
 int main(int argc, char *argv[]) {
-    FILE* file = fopen(argv[1], "r");
-    if (!file) return 1;
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <input_file> <output_file>\n", argv[0]);
+        return 1;
+    }
+
+    FILE* file = fopen(argv[1], "rb");
+    if (!file) {
+        fprintf(stderr, "fopen failed: %s\n", argv[1]);
+        return 1;
+    }
+
     int V, E;
     fread(&V, sizeof(int), 1, file);
     fread(&E, sizeof(int), 1, file);
+    
+    // Padding V to multiple of 64 for simplified kernel boundary checks
+    int V_padded = V;
+    if (V % BLOCK_SIZE != 0) {
+        V_padded = (V / BLOCK_SIZE + 1) * BLOCK_SIZE;
+    }
+    
+    printf("V: %d, E: %d, V_padded: %d\n", V, E, V_padded);
 
-    // Padding 到 64 的倍數
-    int padded_V = ((V + EXTEND_BLOCK_SIZE - 1) / EXTEND_BLOCK_SIZE) * EXTEND_BLOCK_SIZE;
-    size_t size = sizeof(int) * padded_V * padded_V;
-    int *h_dist;
-    cudaCheck(cudaMallocHost(&h_dist, size));
+    // Host Memory Allocation
+    // 使用 pinned memory 加速傳輸
+    int* h_dist;
+    cudaCheck(cudaMallocHost(&h_dist, sizeof(int) * V_padded * V_padded));
 
-    for (int i = 0; i < padded_V; ++i) {
-        for (int j = 0; j < padded_V; ++j) {
-            h_dist[i * padded_V + j] = (i == j) ? 0 : INF;
+    // Initialize with INF
+    // 平行化初始化
+    #pragma omp parallel for
+    for (int i = 0; i < V_padded; ++i) {
+        for (int j = 0; j < V_padded; ++j) {
+            if (i == j) h_dist[i * V_padded + j] = 0;
+            else h_dist[i * V_padded + j] = INF;
         }
     }
 
+    // Read Edges
     vector<int> edge_buffer(E * 3);
-    fread(edge_buffer.data(), sizeof(int), E * 3, file) != (size_t)(E * 3);
+    fread(edge_buffer.data(), sizeof(int), E * 3, file);
     fclose(file);
 
     for (int i = 0; i < E; ++i) {
         int u = edge_buffer[i*3 + 0];
         int v = edge_buffer[i*3 + 1];
         int w = edge_buffer[i*3 + 2];
-        h_dist[u * padded_V + v] = w;
+        h_dist[u * V_padded + v] = w;
     }
 
-    int *d_dist;
-    cudaCheck(cudaMalloc(&d_dist, size));
-    cudaCheck(cudaMemcpy(d_dist, h_dist, size, cudaMemcpyHostToDevice));
+    // Device Memory Allocation
+    int* d_dist;
+    cudaCheck(cudaMalloc(&d_dist, sizeof(int) * V_padded * V_padded));
+    cudaCheck(cudaMemcpy(d_dist, h_dist, sizeof(int) * V_padded * V_padded, cudaMemcpyHostToDevice));
 
-    int rounds = padded_V / EXTEND_BLOCK_SIZE; 
-    dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
+    int rounds = V_padded / BLOCK_SIZE;
+    dim3 threads(16, 16); 
 
     for (int r = 0; r < rounds; ++r) {
-        phase1<<<1, dimBlock>>>(d_dist, padded_V, r);
+        // Phase 1: Diagonal Block
+        floyd_warshall_block_kernel<<<1, threads>>>(d_dist, V_padded, r, 0);
         
-        dim3 dimGrid2(rounds, 2); 
-        phase2<<<dimGrid2, dimBlock>>>(d_dist, padded_V, r);
-        
-        dim3 dimGrid3(rounds, rounds);
-        phase3<<<dimGrid3, dimBlock>>>(d_dist, padded_V, r);
+        // Phase 2: Pivot Row & Col Blocks
+        if (rounds > 1) {
+            dim3 grid2(rounds - 1, 2);
+            floyd_warshall_block_kernel<<<grid2, threads>>>(d_dist, V_padded, r, 1);
+        }
+
+        // Phase 3: Remaining Blocks
+        dim3 grid3(rounds, rounds);
+        floyd_warshall_block_kernel<<<grid3, threads>>>(d_dist, V_padded, r, 2);
     }
-    
-    cudaCheck(cudaMemcpy(h_dist, d_dist, size, cudaMemcpyDeviceToHost));
-    ofstream out(argv[2], ios::binary);
-    for (int i = 0; i < V; ++i) {
-        out.write((char*)&h_dist[i * padded_V], sizeof(int) * V);
+
+    // Copy back
+    cudaCheck(cudaMemcpy(h_dist, d_dist, sizeof(int) * V_padded * V_padded, cudaMemcpyDeviceToHost));
+    FILE* outfile = fopen(argv[2], "wb");
+    if (V == V_padded) {
+        fwrite(h_dist, sizeof(int), V * V, outfile);
+    } else {
+        for (int i = 0; i < V; ++i) {
+            fwrite(&h_dist[i * V_padded], sizeof(int), V, outfile);
+        }
     }
-    out.close();
-    
+    fclose(outfile);
+
+    // Cleanup
     cudaFreeHost(h_dist);
     cudaFree(d_dist);
+
     return 0;
 }
