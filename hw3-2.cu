@@ -38,28 +38,24 @@ __global__ void floyd_warshall_block_kernel(int* dist, int V_padded, int Round, 
             bx = (idx < Round) ? idx : idx + 1;
             by = Round;
         } else {
-            // 處理 Pivot Col: (idx, Round)
             bx = Round;
             by = (idx < Round) ? idx : idx + 1;
         }
     } else {
         // Phase 3: 處理所有剩餘 Block (by, bx)
-        // 注意跳過 Pivot Row 和 Pivot Col
         bx = blockIdx.x;
         by = blockIdx.y;
-        // 如果剛好是對角線所在的行或列，直接退出 (Phase 1, 2 已處理)
         if (bx == Round || by == Round) return; 
     }
 
-    __shared__ int sm_a[64][64]; // Pivot Col Block: dist[by][Round] -> 用於提供 dist[i][k]
-    __shared__ int sm_b[64][64]; // Pivot Row Block: dist[Round][bx] -> 用於提供 dist[k][j]
+    __shared__ int sm_a[64][64];
+    __shared__ int sm_b[64][64];
 
     // 執行緒 ID
     int tx = threadIdx.x; // 0..15
     int ty = threadIdx.y; // 0..15
 
     // 計算當前 Block 在 Global Memory 的起始偏移量
-    // 每個 Block 大小 64x64
     size_t block_start_idx = (size_t)by * 64 * V_padded + bx * 64;
     size_t pivot_col_start = (size_t)by * 64 * V_padded + Round * 64;
     size_t pivot_row_start = (size_t)Round * 64 * V_padded + bx * 64;
@@ -73,30 +69,17 @@ __global__ void floyd_warshall_block_kernel(int* dist, int V_padded, int Round, 
     // 為了利用 int4，我們將指針轉型
     int4* gl_ptr_a = (int4*)(dist + pivot_col_start);
     int4* gl_ptr_b = (int4*)(dist + pivot_row_start);
-
-    // 映射：執行緒 (ty, tx) 視為線性 ID
     int tid = ty * 16 + tx;
-    
-    // 每個執行緒載入 4 行 (因為 64行 / 16(blockDim.y) = 4)
-    // 但為了 int4 對齊，我們按行載入
-    // sm_a[Row][Col]
-    // 每個 int4 包含 4 個 int，對應 4 列
-    // 我們需要載入整個 64x64
-    // 簡單映射: tx 對應 x 軸的 0..15 (x4 -> 0..63)
-    // ty 對應 y 軸的 0..15, 16..31, 32..47, 48..63 (stride 16)
 
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         int row = ty + i * 16;
-        
         // Load Pivot Col Block -> sm_a
-        // 讀取 Global Memory
         int4 vec_a = gl_ptr_a[row * (V_padded / 4) + tx];
         sm_a[row][tx * 4 + 0] = vec_a.x;
         sm_a[row][tx * 4 + 1] = vec_a.y;
         sm_a[row][tx * 4 + 2] = vec_a.z;
         sm_a[row][tx * 4 + 3] = vec_a.w;
-
         // Load Pivot Row Block -> sm_b
         int4 vec_b = gl_ptr_b[row * (V_padded / 4) + tx];
         sm_b[row][tx * 4 + 0] = vec_b.x;
@@ -140,10 +123,9 @@ __global__ void floyd_warshall_block_kernel(int* dist, int V_padded, int Round, 
                     }
                 }
             }
-            __syncthreads(); // 必須同步，讓別的 thread 看到新的 sm_a
+            __syncthreads();
         }
         
-        // 寫回 Global Memory
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
             int row = ty + i * 16;
@@ -208,17 +190,7 @@ __global__ void floyd_warshall_block_kernel(int* dist, int V_padded, int Round, 
 // ---------------------------------------------------------------------------
 
 int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <input_file> <output_file>\n", argv[0]);
-        return 1;
-    }
-
     FILE* file = fopen(argv[1], "rb");
-    if (!file) {
-        fprintf(stderr, "fopen failed: %s\n", argv[1]);
-        return 1;
-    }
-
     int V, E;
     fread(&V, sizeof(int), 1, file);
     fread(&E, sizeof(int), 1, file);
@@ -228,16 +200,8 @@ int main(int argc, char *argv[]) {
     if (V % BLOCK_SIZE != 0) {
         V_padded = (V / BLOCK_SIZE + 1) * BLOCK_SIZE;
     }
-    
-    printf("V: %d, E: %d, V_padded: %d\n", V, E, V_padded);
-
-    // Host Memory Allocation
-    // 使用 pinned memory 加速傳輸
     int* h_dist;
-    cudaCheck(cudaMallocHost(&h_dist, sizeof(int) * V_padded * V_padded));
-
-    // Initialize with INF
-    // 平行化初始化
+    cudaMallocHost(&h_dist, sizeof(int) * V_padded * V_padded);
     #pragma omp parallel for
     for (int i = 0; i < V_padded; ++i) {
         for (int j = 0; j < V_padded; ++j) {
@@ -260,8 +224,8 @@ int main(int argc, char *argv[]) {
 
     // Device Memory Allocation
     int* d_dist;
-    cudaCheck(cudaMalloc(&d_dist, sizeof(int) * V_padded * V_padded));
-    cudaCheck(cudaMemcpy(d_dist, h_dist, sizeof(int) * V_padded * V_padded, cudaMemcpyHostToDevice));
+    cudaMalloc(&d_dist, sizeof(int) * V_padded * V_padded);
+    cudaMemcpy(d_dist, h_dist, sizeof(int) * V_padded * V_padded, cudaMemcpyHostToDevice);
 
     int rounds = V_padded / BLOCK_SIZE;
     dim3 threads(16, 16); 
@@ -282,7 +246,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Copy back
-    cudaCheck(cudaMemcpy(h_dist, d_dist, sizeof(int) * V_padded * V_padded, cudaMemcpyDeviceToHost));
+    cudaMemcpy(h_dist, d_dist, sizeof(int) * V_padded * V_padded, cudaMemcpyDeviceToHost);
     FILE* outfile = fopen(argv[2], "wb");
     if (V == V_padded) {
         fwrite(h_dist, sizeof(int), V * V, outfile);
@@ -292,8 +256,6 @@ int main(int argc, char *argv[]) {
         }
     }
     fclose(outfile);
-
-    // Cleanup
     cudaFreeHost(h_dist);
     cudaFree(d_dist);
 
